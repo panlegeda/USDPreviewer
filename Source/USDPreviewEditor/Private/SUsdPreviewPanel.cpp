@@ -19,6 +19,9 @@
 #include "Widgets/SBoxPanel.h"
 #include "Widgets/Notifications/SNotificationList.h"
 #include "Widgets/Text/STextBlock.h"
+#include "Logging/LogMacros.h"
+
+DEFINE_LOG_CATEGORY_STATIC(LogUSDPreviewPanel, Log, All);
 
 namespace USDPreviewPanelPrivate
 {
@@ -176,12 +179,21 @@ bool SUsdPreviewPanel::SpawnOrUpdateUsdPreviewActor(const FString& UsdFilePath)
 {
 	if (!GEditor)
 	{
+		UE_LOG(LogUSDPreviewPanel, Error, TEXT("GEditor is null."));
+		return false;
+	}
+
+	const FString NormalizedUsdPath = FPaths::ConvertRelativePathToFull(UsdFilePath);
+	if (!FPaths::FileExists(NormalizedUsdPath))
+	{
+		UE_LOG(LogUSDPreviewPanel, Error, TEXT("USD file does not exist: %s"), *NormalizedUsdPath);
 		return false;
 	}
 
 	UWorld* World = GEditor->GetEditorWorldContext().World();
 	if (!World)
 	{
+		UE_LOG(LogUSDPreviewPanel, Error, TEXT("Editor world is null."));
 		return false;
 	}
 
@@ -192,6 +204,7 @@ bool SUsdPreviewPanel::SpawnOrUpdateUsdPreviewActor(const FString& UsdFilePath)
 	}
 	if (!UsdActorClass)
 	{
+		UE_LOG(LogUSDPreviewPanel, Error, TEXT("Could not find /Script/USDStage.UsdStageActor. Ensure USDStage plugin is enabled."));
 		return false;
 	}
 
@@ -213,31 +226,115 @@ bool SUsdPreviewPanel::SpawnOrUpdateUsdPreviewActor(const FString& UsdFilePath)
 	}
 	if (!TargetActor)
 	{
+		UE_LOG(LogUSDPreviewPanel, Error, TEXT("Failed to spawn USD preview actor."));
 		return false;
 	}
 
 	bool bSetPathProperty = false;
-	for (TFieldIterator<FProperty> PropIt(UsdActorClass); PropIt; ++PropIt)
+	UFunction* SetRootLayerFunction = UsdActorClass->FindFunctionByName(TEXT("SetRootLayer"));
+	if (SetRootLayerFunction)
+	{
+		for (TFieldIterator<FProperty> ParamIt(SetRootLayerFunction); ParamIt; ++ParamIt)
+		{
+			FProperty* Param = *ParamIt;
+			if (!Param->HasAnyPropertyFlags(CPF_Parm) || Param->HasAnyPropertyFlags(CPF_ReturnParm))
+			{
+				continue;
+			}
+
+			TArray<uint8> ParamsBuffer;
+			ParamsBuffer.SetNumZeroed(SetRootLayerFunction->ParmsSize);
+
+			if (FStrProperty* StringParam = CastField<FStrProperty>(Param))
+			{
+				StringParam->SetPropertyValue_InContainer(ParamsBuffer.GetData(), NormalizedUsdPath);
+				TargetActor->ProcessEvent(SetRootLayerFunction, ParamsBuffer.GetData());
+				bSetPathProperty = true;
+			}
+			else if (FStructProperty* StructParam = CastField<FStructProperty>(Param))
+			{
+				if (StructParam->Struct && StructParam->Struct->GetFName() == TEXT("FilePath"))
+				{
+					void* StructData = StructParam->ContainerPtrToValuePtr<void>(ParamsBuffer.GetData());
+					if (StructData)
+					{
+						if (FStrProperty* InnerFilePathProp = FindFProperty<FStrProperty>(StructParam->Struct, TEXT("FilePath")))
+						{
+							void* InnerFilePathData = InnerFilePathProp->ContainerPtrToValuePtr<void>(StructData);
+							InnerFilePathProp->SetPropertyValue(InnerFilePathData, NormalizedUsdPath);
+							TargetActor->ProcessEvent(SetRootLayerFunction, ParamsBuffer.GetData());
+							bSetPathProperty = true;
+						}
+					}
+				}
+			}
+
+			break;
+		}
+	}
+
+	bool bFoundCandidateProperty = false;
+	for (TFieldIterator<FProperty> PropIt(UsdActorClass); PropIt && !bSetPathProperty; ++PropIt)
 	{
 		FProperty* Property = *PropIt;
-		FStrProperty* StringProperty = CastField<FStrProperty>(Property);
-		if (!StringProperty)
+		const FName PropName = Property->GetFName();
+		if (PropName != TEXT("RootLayer") && PropName != TEXT("FilePath"))
 		{
 			continue;
 		}
 
-		const FName PropName = Property->GetFName();
-		if (PropName == TEXT("RootLayer") || PropName == TEXT("FilePath"))
+		bFoundCandidateProperty = true;
+		if (FStrProperty* StringProperty = CastField<FStrProperty>(Property))
 		{
-			StringProperty->SetPropertyValue_InContainer(TargetActor, UsdFilePath);
+			StringProperty->SetPropertyValue_InContainer(TargetActor, NormalizedUsdPath);
 			bSetPathProperty = true;
 			break;
 		}
+
+		// Newer UE versions may expose RootLayer as a FFilePath struct.
+		if (FStructProperty* StructProperty = CastField<FStructProperty>(Property))
+		{
+			if (StructProperty->Struct && StructProperty->Struct->GetFName() == TEXT("FilePath"))
+			{
+				void* StructData = StructProperty->ContainerPtrToValuePtr<void>(TargetActor);
+				if (StructData)
+				{
+					if (FStrProperty* InnerFilePathProp = FindFProperty<FStrProperty>(StructProperty->Struct, TEXT("FilePath")))
+					{
+						void* InnerFilePathData = InnerFilePathProp->ContainerPtrToValuePtr<void>(StructData);
+						InnerFilePathProp->SetPropertyValue(InnerFilePathData, NormalizedUsdPath);
+						bSetPathProperty = true;
+						break;
+					}
+				}
+			}
+		}
+	}
+
+	if (!bFoundCandidateProperty)
+	{
+		UE_LOG(LogUSDPreviewPanel, Error, TEXT("UsdStageActor has no RootLayer/FilePath property in this UE version."));
+	}
+	else if (!bSetPathProperty)
+	{
+		UE_LOG(LogUSDPreviewPanel, Error, TEXT("Found RootLayer/FilePath but could not set USD path due to unsupported property type."));
 	}
 
 	TargetActor->Modify();
 	TargetActor->RerunConstructionScripts();
 	TargetActor->PostEditChange();
+	if (UFunction* ReloadStageFunction = UsdActorClass->FindFunctionByName(TEXT("ReloadAnimations")))
+	{
+		TargetActor->ProcessEvent(ReloadStageFunction, nullptr);
+	}
+	if (UFunction* LoadStageFunction = UsdActorClass->FindFunctionByName(TEXT("LoadUsdStage")))
+	{
+		TargetActor->ProcessEvent(LoadStageFunction, nullptr);
+	}
+	if (UFunction* OpenStageFunction = UsdActorClass->FindFunctionByName(TEXT("OpenUsdStage")))
+	{
+		TargetActor->ProcessEvent(OpenStageFunction, nullptr);
+	}
 
 	if (GEditor)
 	{
