@@ -12,6 +12,7 @@
 #include "Misc/Paths.h"
 #include "UObject/FieldIterator.h"
 #include "UObject/UnrealType.h"
+#include "UObject/UObjectGlobals.h"
 #include "Widgets/Input/SButton.h"
 #include "Widgets/Layout/SBox.h"
 #include "Widgets/Layout/SSeparator.h"
@@ -228,6 +229,37 @@ bool SUsdPreviewPanel::SpawnOrUpdateUsdPreviewActor(const FString& UsdFilePath)
 	{
 		UE_LOG(LogUSDPreviewPanel, Error, TEXT("Failed to spawn USD preview actor."));
 		return false;
+	}
+
+	// Browse-only mode: force a transient (memory-only) USD asset cache so preview won't create content assets.
+	if (UClass* UsdAssetCacheClass = FindObject<UClass>(nullptr, TEXT("/Script/USDClasses.UsdAssetCache3")))
+	{
+		UObject* TransientCache = NewObject<UObject>(GetTransientPackage(), UsdAssetCacheClass, NAME_None, RF_Transient);
+		if (TransientCache)
+		{
+			if (UFunction* SetUsdAssetCacheFunction = UsdActorClass->FindFunctionByName(TEXT("SetUsdAssetCache")))
+			{
+				for (TFieldIterator<FProperty> ParamIt(SetUsdAssetCacheFunction); ParamIt; ++ParamIt)
+				{
+					FProperty* Param = *ParamIt;
+					if (!Param->HasAnyPropertyFlags(CPF_Parm) || Param->HasAnyPropertyFlags(CPF_ReturnParm))
+					{
+						continue;
+					}
+
+					if (FObjectPropertyBase* ObjectParam = CastField<FObjectPropertyBase>(Param))
+					{
+						TArray<uint8> ParamsBuffer;
+						ParamsBuffer.SetNumZeroed(SetUsdAssetCacheFunction->ParmsSize);
+						void* ParamData = ObjectParam->ContainerPtrToValuePtr<void>(ParamsBuffer.GetData());
+						ObjectParam->SetObjectPropertyValue(ParamData, TransientCache);
+						TargetActor->ProcessEvent(SetUsdAssetCacheFunction, ParamsBuffer.GetData());
+						UE_LOG(LogUSDPreviewPanel, Log, TEXT("Assigned transient UsdAssetCache3 for browse-only preview."));
+					}
+					break;
+				}
+			}
+		}
 	}
 
 	bool bSetPathProperty = false;
